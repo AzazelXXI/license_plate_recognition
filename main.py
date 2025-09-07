@@ -20,7 +20,41 @@ def parse_args():
         default="runs/pose_plate/weights/best.pt",
         help="Đường dẫn weights (.pt), mặc định dùng weights đã train",
     )
-    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.5,
+        help="Confidence threshold (higher = fewer false positives)",
+    )
+    parser.add_argument("--iou", type=float, default=0.6, help="NMS IoU threshold")
+    parser.add_argument(
+        "--max-det", type=int, default=50, help="Max detections per image"
+    )
+    # Simple geometry filters to suppress obvious non-plates
+    parser.add_argument(
+        "--min-area",
+        type=float,
+        default=0.0003,
+        help="Min bbox area ratio (w*h / frame_area)",
+    )
+    parser.add_argument(
+        "--max-area",
+        type=float,
+        default=0.5,
+        help="Max bbox area ratio (w*h / frame_area)",
+    )
+    parser.add_argument(
+        "--min-aspect",
+        type=float,
+        default=1.2,
+        help="Min aspect ratio w/h (plates are usually wider than tall)",
+    )
+    parser.add_argument(
+        "--max-aspect",
+        type=float,
+        default=10.0,
+        help="Max aspect ratio w/h",
+    )
     parser.add_argument(
         "--resize",
         type=int,
@@ -74,7 +108,16 @@ def _order_points_four(pts: np.ndarray) -> np.ndarray:
     return np.array([tl, tr, br, bl], dtype="float32")
 
 
-def draw_plates_and_pose(frame, results, conf_thresh=0.25, kp_thresh=0.10):
+def draw_plates_and_pose(
+    frame,
+    results,
+    conf_thresh=0.25,
+    kp_thresh=0.10,
+    min_area=0.0,
+    max_area=1.0,
+    min_aspect=0.0,
+    max_aspect=1e9,
+):
     boxes = results.boxes
     if boxes is None or len(boxes) == 0:
         return frame
@@ -90,6 +133,9 @@ def draw_plates_and_pose(frame, results, conf_thresh=0.25, kp_thresh=0.10):
         if getattr(results.keypoints, "conf", None) is not None:
             kcf = _to_numpy(results.keypoints.conf)
 
+    H, W = frame.shape[:2]
+    img_area = float(W * H) if W and H else 1.0
+
     for i in range(len(boxes)):
         box = boxes[i]
         conf = float(box.conf[0]) if box.conf is not None else 0.0
@@ -101,6 +147,14 @@ def draw_plates_and_pose(frame, results, conf_thresh=0.25, kp_thresh=0.10):
 
         # Draw bbox
         x1, y1, x2, y2 = box.xyxy[0].int().cpu().tolist()
+        bw, bh = max(0, x2 - x1), max(0, y2 - y1)
+        # Geometry gates
+        area_ratio = (bw * bh) / img_area
+        aspect = (bw / max(1, bh)) if bh > 0 else 1e9
+        if not (min_area <= area_ratio <= max_area):
+            continue
+        if not (min_aspect <= aspect <= max_aspect):
+            continue
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         # Draw 4 keypoints + polygon if available
@@ -197,8 +251,23 @@ def main():
         if args.resize:
             frame = cv2.resize(frame, tuple(args.resize))
 
-        res = model(frame, verbose=False)[0]
-        frame = draw_plates_and_pose(frame, res, conf_thresh=args.conf)
+        res = model(
+            frame,
+            conf=args.conf,
+            iou=args.iou,
+            classes=[0],  # only license plate class
+            verbose=False,
+            max_det=args.max_det,
+        )[0]
+        frame = draw_plates_and_pose(
+            frame,
+            res,
+            conf_thresh=args.conf,
+            min_area=args.min_area,
+            max_area=args.max_area,
+            min_aspect=args.min_aspect,
+            max_aspect=args.max_aspect,
+        )
 
         cv2.imshow("Plate", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):

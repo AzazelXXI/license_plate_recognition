@@ -23,18 +23,21 @@ def parse_args():
     parser.add_argument(
         "--conf",
         type=float,
-        default=0.5,
+        default=0.25,
         help="Confidence threshold (higher = fewer false positives)",
     )
     parser.add_argument("--iou", type=float, default=0.6, help="NMS IoU threshold")
     parser.add_argument(
         "--max-det", type=int, default=50, help="Max detections per image"
     )
+    parser.add_argument(
+        "--imgsz", type=int, default=640, help="Inference image size (long side)"
+    )
     # Simple geometry filters to suppress obvious non-plates
     parser.add_argument(
         "--min-area",
         type=float,
-        default=0.0003,
+        default=0.00015,
         help="Min bbox area ratio (w*h / frame_area)",
     )
     parser.add_argument(
@@ -46,7 +49,7 @@ def parse_args():
     parser.add_argument(
         "--min-aspect",
         type=float,
-        default=1.2,
+        default=1.0,
         help="Min aspect ratio w/h (plates are usually wider than tall)",
     )
     parser.add_argument(
@@ -66,6 +69,23 @@ def parse_args():
         "--list-cams",
         action="store_true",
         help="Liệt kê index camera khả dụng rồi thoát",
+    )
+    parser.add_argument(
+        "--fallback-model",
+        type=str,
+        default="best.pt",
+        help="Model phát hiện (detect) fallback khi pose không ra box (mặc định thử ./best.pt)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="cpu | cuda | cuda:0 ... (mặc định tự chọn)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Hiển thị thông tin debug và bỏ bớt filter hình học",
     )
     return parser.parse_args()
 
@@ -117,6 +137,7 @@ def draw_plates_and_pose(
     max_area=1.0,
     min_aspect=0.0,
     max_aspect=1e9,
+    debug=False,
 ):
     boxes = results.boxes
     if boxes is None or len(boxes) == 0:
@@ -151,10 +172,11 @@ def draw_plates_and_pose(
         # Geometry gates
         area_ratio = (bw * bh) / img_area
         aspect = (bw / max(1, bh)) if bh > 0 else 1e9
-        if not (min_area <= area_ratio <= max_area):
-            continue
-        if not (min_aspect <= aspect <= max_aspect):
-            continue
+        if not debug:
+            if not (min_area <= area_ratio <= max_area):
+                continue
+            if not (min_aspect <= aspect <= max_aspect):
+                continue
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         # Draw 4 keypoints + polygon if available
@@ -231,10 +253,23 @@ def main():
         )
         return
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = (
+        args.device
+        if args.device is not None
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     print(f"⚡ Device: {device}")
     print(f"✅ Using model: {chosen}")
     model = YOLO(chosen).to(device)
+
+    # Optional fallback detector
+    fallback_model = None
+    if args.fallback_model and os.path.exists(args.fallback_model):
+        try:
+            fallback_model = YOLO(args.fallback_model).to(device)
+            print(f"ℹ️  Fallback detector ready: {args.fallback_model}")
+        except Exception as e:
+            print("⚠️  Không thể tải fallback model:", e)
 
     cap = open_capture(args.source)
     if cap is None or not cap.isOpened():
@@ -253,12 +288,43 @@ def main():
 
         res = model(
             frame,
+            imgsz=args.imgsz,
             conf=args.conf,
             iou=args.iou,
             classes=[0],  # only license plate class
             verbose=False,
             max_det=args.max_det,
         )[0]
+        n_boxes = int(len(res.boxes)) if res.boxes is not None else 0
+
+        # Fallback to detector if pose returns 0 boxes
+        used_fallback = False
+        if n_boxes == 0 and fallback_model is not None:
+            res = fallback_model(
+                frame,
+                conf=args.conf,
+                iou=args.iou,
+                classes=[0],
+                verbose=False,
+                max_det=args.max_det,
+            )[0]
+            used_fallback = True
+            n_boxes = int(len(res.boxes)) if res.boxes is not None else 0
+
+        if args.debug:
+            msg = f"det:{n_boxes} conf>={args.conf}"
+            if used_fallback:
+                msg += " [fallback]"
+            cv2.putText(
+                frame,
+                msg,
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
         frame = draw_plates_and_pose(
             frame,
             res,
@@ -267,6 +333,7 @@ def main():
             max_area=args.max_area,
             min_aspect=args.min_aspect,
             max_aspect=args.max_aspect,
+            debug=args.debug,
         )
 
         cv2.imshow("Plate", frame)

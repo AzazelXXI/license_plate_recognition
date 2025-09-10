@@ -1,7 +1,5 @@
 .venv
-License Plate.v1i.yolov8
 dataset
-datasets2
-dataset3
+dataset1
+dataset4corner
 MakeFile
-runs

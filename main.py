@@ -1,345 +1,416 @@
-import os
-import cv2
-import torch
-import argparse
-import numpy as np
+import os, cv2, torch, argparse
 from ultralytics import YOLO
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Plate detection viewer")
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="0",
-        help="0/1... cho webcam hoặc đường dẫn file/RTSP",
+    p = argparse.ArgumentParser(description="License plate viewer (simple)")
+    p.add_argument(
+        "--source", type=str, default="0", help="Webcam index hoặc RTSP/file path"
     )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="runs/pose_plate/weights/best.pt",
-        help="Đường dẫn weights (.pt), mặc định dùng weights đã train",
-    )
-    parser.add_argument(
+    p.add_argument(
         "--conf",
         type=float,
-        default=0.25,
-        help="Confidence threshold (higher = fewer false positives)",
+        default=0.05,
+        help="Confidence threshold (lower default for more detections)",
     )
-    parser.add_argument("--iou", type=float, default=0.6, help="NMS IoU threshold")
-    parser.add_argument(
-        "--max-det", type=int, default=50, help="Max detections per image"
+    p.add_argument("--imgsz", type=int, default=640, help="Image size")
+    p.add_argument("--iou", type=float, default=0.6, help="IoU NMS")
+    p.add_argument("--max-det", type=int, default=50, help="Max detections")
+    p.add_argument("--device", type=str, default=None, help="cpu | cuda | cuda:0 ...")
+    p.add_argument(
+        "--resize", type=int, nargs=2, metavar=("W", "H"), help="Resize hiển thị"
     )
-    parser.add_argument(
-        "--imgsz", type=int, default=640, help="Inference image size (long side)"
+    p.add_argument(
+        "--list-cams", action="store_true", help="Liệt kê webcam index rồi thoát"
     )
-    # Simple geometry filters to suppress obvious non-plates
-    parser.add_argument(
+    p.add_argument(
+        "--no-bbox", action="store_true", help="Ẩn khung bbox, chỉ hiển thị keypoints"
+    )
+    p.add_argument(
+        "--ultra-style",
+        action="store_true",
+        help="Style giống Ultralytics (không đánh số thứ tự điểm)",
+    )
+    # Giảm nhấp nháy
+    p.add_argument(
+        "--smooth-alpha",
+        type=float,
+        default=0.4,
+        help="Hệ số EMA (0-1) làm mượt bbox/kpts; 0=không cập nhật, 1=không làm mượt",
+    )
+    p.add_argument(
+        "--persist",
+        type=int,
+        default=6,
+        help="Số frame giữ lại đối tượng khi tạm mất (giảm nhấp nháy)",
+    )
+    p.add_argument(
+        "--hyst-enter",
+        type=float,
+        default=0.06,
+        help="Ngưỡng confidence để tạo/kích hoạt track (hysteresis). đặt hơi cao hơn --conf",
+    )
+    p.add_argument(
+        "--hyst-exit",
+        type=float,
+        default=0.02,
+        help="Ngưỡng duy trì track đang hoạt động (thấp hơn enter)",
+    )
+    p.add_argument(
+        "--no-filter",
+        action="store_true",
+        help="Disable confidence gating: show/create tracks for all detections regardless of confidence",
+    )
+    p.add_argument(
         "--min-area",
-        type=float,
-        default=0.00015,
-        help="Min bbox area ratio (w*h / frame_area)",
+        type=int,
+        default=0,
+        help="Minimum bounding box area in pixels to accept a detection (0 to disable)",
     )
-    parser.add_argument(
-        "--max-area",
-        type=float,
-        default=0.5,
-        help="Max bbox area ratio (w*h / frame_area)",
-    )
-    parser.add_argument(
+    p.add_argument(
         "--min-aspect",
         type=float,
-        default=1.0,
-        help="Min aspect ratio w/h (plates are usually wider than tall)",
+        default=2.0,
+        help="Minimum width/height aspect ratio to accept a plate candidate (set 0 to disable)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--max-aspect",
         type=float,
-        default=10.0,
-        help="Max aspect ratio w/h",
+        default=6.0,
+        help="Maximum width/height aspect ratio to accept a plate candidate (set 0 to disable)",
     )
-    parser.add_argument(
-        "--resize",
+    p.add_argument(
+        "--min-width",
         type=int,
-        nargs=2,
-        metavar=("W", "H"),
-        help="Resize khung hình trước khi hiển thị",
+        default=0,
+        help="Minimum bbox width in pixels to accept a detection (0 to disable)",
     )
-    parser.add_argument(
-        "--list-cams",
-        action="store_true",
-        help="Liệt kê index camera khả dụng rồi thoát",
+    p.add_argument(
+        "--min-height",
+        type=int,
+        default=0,
+        help="Minimum bbox height in pixels to accept a detection (0 to disable)",
     )
-    parser.add_argument(
-        "--fallback-model",
-        type=str,
-        default="best.pt",
-        help="Model phát hiện (detect) fallback khi pose không ra box (mặc định thử ./best.pt)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="cpu | cuda | cuda:0 ... (mặc định tự chọn)",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Hiển thị thông tin debug và bỏ bớt filter hình học",
-    )
-    return parser.parse_args()
+    return p.parse_args()
 
 
-def open_capture(source_str: str):
-    s = source_str.strip()
-    if s.isdigit():  # webcam index
-        idx = int(s)
-        for backend in (cv2.CAP_V4L2, cv2.CAP_ANY):
-            cap = cv2.VideoCapture(idx, backend)
-            if cap.isOpened():
-                return cap
-        return None
-    else:  # rtsp/http/file
-        return cv2.VideoCapture(s, cv2.CAP_FFMPEG)
+def list_cams(n=10):
+    found = []
+    for i in range(n):
+        cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
+        if cap.isOpened():
+            found.append(i)
+            cap.release()
+    return found
 
 
-def _to_numpy(x):
-    try:
-        if isinstance(x, np.ndarray):
-            return x
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu().numpy()
-    except Exception:
-        pass
-    return np.asarray(x)
+def open_stream(src: str):
+    s = src.strip()
+    if s.isdigit():
+        cap = cv2.VideoCapture(int(s), cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(int(s))
+        return cap
+    return cv2.VideoCapture(s, cv2.CAP_FFMPEG)
 
 
-def _order_points_four(pts: np.ndarray) -> np.ndarray:
-    """Sắp xếp 4 điểm theo thứ tự: top-left, top-right, bottom-right, bottom-left."""
-    pts = np.asarray(pts, dtype="float32")
-    if pts.shape[0] != 4:
-        return pts
-    s = pts.sum(axis=1)
-    diff = pts[:, 1] - pts[:, 0]
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(diff)]
-    bl = pts[np.argmax(diff)]
-    return np.array([tl, tr, br, bl], dtype="float32")
+def load_model(path: str, device: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Không tìm thấy weights: {path}")
+    m = YOLO(path).to(device)
+    print(f"✅ Loaded model: {path} (task={getattr(m,'task','?')})")
+    return m
 
 
-def draw_plates_and_pose(
-    frame,
-    results,
-    conf_thresh=0.25,
-    kp_thresh=0.10,
-    min_area=0.0,
-    max_area=1.0,
-    min_aspect=0.0,
-    max_aspect=1e9,
-    debug=False,
-):
-    boxes = results.boxes
-    if boxes is None or len(boxes) == 0:
+def draw(frame, result, conf, no_bbox=False, ultra_style=False):
+    boxes = result.boxes
+    if boxes is None:
         return frame
-
-    # Keypoints (n, K, 2) and optional confidence (n, K)
-    kxy = None
-    kcf = None
-    if (
-        getattr(results, "keypoints", None) is not None
-        and results.keypoints.xy is not None
-    ):
-        kxy = _to_numpy(results.keypoints.xy)
-        if getattr(results.keypoints, "conf", None) is not None:
-            kcf = _to_numpy(results.keypoints.conf)
-
-    H, W = frame.shape[:2]
-    img_area = float(W * H) if W and H else 1.0
-
-    for i in range(len(boxes)):
-        box = boxes[i]
-        conf = float(box.conf[0]) if box.conf is not None else 0.0
-        if conf < conf_thresh:
+    # Pose keypoints (expects 4 corners) if available
+    has_kps = (
+        hasattr(result, "keypoints")
+        and result.keypoints is not None
+        and getattr(result.keypoints, "xy", None) is not None
+    )
+    kps_xy = result.keypoints.xy if has_kps else None  # Tensor [N,K,2]
+    # Simple skeleton for 4 điểm: 0-1-2-3-0 (nếu đủ 4 keypoints)
+    for idx, b in enumerate(boxes):
+        c = float(b.conf[0]) if b.conf is not None else 0.0
+        if c < conf:
             continue
-        cls = int(box.cls[0]) if box.cls is not None else 0
-        if cls != 0:  # Chỉ vẽ biển số (class 0)
+        cls = int(b.cls[0]) if b.cls is not None else 0
+        if cls != 0:
             continue
+        x1, y1, x2, y2 = b.xyxy[0].int().cpu().tolist()
+        if not no_bbox:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        label = f"plate {c:.2f}"
+        # Draw pose corners if present
+        if has_kps and idx < len(kps_xy):
+            pts = kps_xy[idx]
+            if pts.shape[0] >= 4:
+                # Take first 4 points
+                pts4 = pts[:4].cpu().numpy().astype(int)
+                if ultra_style:
+                    # Ultralytics-like: uniform color circles + skeleton lines (cyan)
+                    circle_color = (255, 255, 0)  # BGR cyan
+                    for px, py in pts4:
+                        cv2.circle(
+                            frame, (int(px), int(py)), 4, circle_color, -1, cv2.LINE_AA
+                        )
+                    # skeleton edges
+                    edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+                    for a, bp in edges:
+                        cv2.line(
+                            frame,
+                            tuple(pts4[a]),
+                            tuple(pts4[bp]),
+                            (0, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                else:
+                    # Custom: colored corners + polygon (no numbering if no_bbox & ultra_style false?)
+                    colors = [
+                        (255, 255, 0),
+                        (255, 255, 0),
+                        (255, 255, 0),
+                        (255, 255, 0),
+                    ]
+                    for i, (px, py) in enumerate(pts4):
+                        cv2.circle(
+                            frame, (int(px), int(py)), 4, colors[i % 4], -1, cv2.LINE_AA
+                        )
+                        # bỏ số thứ tự nếu người dùng muốn giống pose => khi ultra_style True đã xử lý
+                    # draw polygon in yellow for better visibility
+                    cv2.polylines(
+                        frame,
+                        [pts4.reshape(-1, 1, 2)],
+                        True,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                label += " kp"
+        if not no_bbox:
+            cv2.putText(
+                frame,
+                label,
+                (x1, max(0, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+    return frame
 
-        # Draw bbox
-        x1, y1, x2, y2 = box.xyxy[0].int().cpu().tolist()
-        bw, bh = max(0, x2 - x1), max(0, y2 - y1)
-        # Geometry gates
-        area_ratio = (bw * bh) / img_area
-        aspect = (bw / max(1, bh)) if bh > 0 else 1e9
-        if not debug:
-            if not (min_area <= area_ratio <= max_area):
-                continue
-            if not (min_aspect <= aspect <= max_aspect):
-                continue
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        # Draw 4 keypoints + polygon if available
-        if kxy is not None and i < kxy.shape[0]:
-            pts = kxy[i]
-            if isinstance(pts, torch.Tensor):
-                pts = _to_numpy(pts)
-            if pts is None or pts.shape[0] < 4:
-                continue
+# ================== Tracking tối giản để giảm nhấp nháy ==================
+class SimpleTrack:
+    _next_id = 0
 
-            # If have per-point confidence, filter very low-conf points
-            mask = None
-            if kcf is not None and i < kcf.shape[0]:
-                confs = kcf[i]
-                mask = confs >= kp_thresh
+    def __init__(self, box, kps, conf, frame_idx):
+        self.id = SimpleTrack._next_id
+        SimpleTrack._next_id += 1
+        self.box = box  # (x1,y1,x2,y2) float
+        self.kps = kps  # ndarray (K,2) or None
+        self.conf = conf
+        self.last_frame = frame_idx
+        self.active = True
+        self.just_updated = True
+
+
+def iou(b1, b2):
+    # boxes tuple
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
+    iw = max(0.0, x2 - x1)
+    ih = max(0.0, y2 - y1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+    a2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+    return inter / (a1 + a2 - inter + 1e-6)
+
+
+def update_tracks(tracks, result, args, frame_idx):
+    alpha = min(max(args.smooth_alpha, 0.0), 1.0)
+    enter = args.hyst_enter
+    exit_c = args.hyst_exit
+    persist = max(args.persist, 0)
+    # reset just_updated flags
+    for t in tracks:
+        t.just_updated = False
+    new_boxes = []
+    has_kps = (
+        hasattr(result, "keypoints")
+        and result.keypoints is not None
+        and getattr(result.keypoints, "xy", None) is not None
+    )
+    kps_xy = result.keypoints.xy if has_kps else None
+    boxes = result.boxes
+    if boxes is not None:
+        for idx, b in enumerate(boxes):
+            c = float(b.conf[0]) if b.conf is not None else 0.0
+            cls = int(b.cls[0]) if b.cls is not None else 0
+            if cls != 0:
+                continue
+            # hysteresis filter (unless user disabled filtering)
+            if c < enter and not getattr(args, "no_filter", False):
+                # sẽ vẫn chấp nhận nếu khớp track cũ đang active và c >= exit
+                pass
+            x1, y1, x2, y2 = b.xyxy[0].cpu().tolist()
+            kps = None
+            if has_kps and idx < len(kps_xy) and kps_xy[idx].shape[0] >= 4:
+                kps = kps_xy[idx][:4].cpu().numpy()
+            # optional area filter
+            area = (x2 - x1) * (y2 - y1)
+            if args.min_area <= 0 or area >= args.min_area:
+                new_boxes.append(((x1, y1, x2, y2), kps, c))
+
+    # matching theo IoU
+    for box, kps, c in new_boxes:
+        best_iou = 0
+        best_track = None
+        for t in tracks:
+            i = iou(box, t.box)
+            if i > best_iou:
+                best_iou = i
+                best_track = t
+        if best_track and best_iou >= 0.3:
+            # hysteresis: nếu conf thấp hơn enter nhưng track đang active và conf >= exit thì giữ
+            if c >= enter or (best_track.active and c >= exit_c):
+                # EMA update
+                if alpha < 1.0:
+                    nb = [
+                        alpha * box[i] + (1 - alpha) * best_track.box[i]
+                        for i in range(4)
+                    ]
+                    best_track.box = tuple(nb)
+                    if kps is not None and best_track.kps is not None and alpha < 1.0:
+                        best_track.kps = alpha * kps + (1 - alpha) * best_track.kps
+                    elif kps is not None:
+                        best_track.kps = kps
+                else:
+                    best_track.box = box
+                    if kps is not None:
+                        best_track.kps = kps
+                best_track.conf = c
+                best_track.last_frame = frame_idx
+                best_track.active = True
+                best_track.just_updated = True
             else:
-                mask = np.ones((pts.shape[0],), dtype=bool)
+                # không đủ điều kiện giữ hoạt động
+                best_track.active = False
+        else:
+            # tạo mới: nếu đủ ngưỡng enter hoặc user muốn no_filter thì tạo mọi detection
+            if c >= enter or getattr(args, "no_filter", False):
+                tracks.append(SimpleTrack(box, kps, c, frame_idx))
 
-            pts_vis = pts[mask]
-            if pts_vis.shape[0] >= 4:
-                # Keep only first 4 visible; then order and draw
-                pts4 = pts_vis[:4]
-                ordered = _order_points_four(pts4)
-                poly = ordered.reshape((-1, 1, 2)).astype(int)
-                cv2.polylines(
-                    frame, [poly], isClosed=True, color=(0, 0, 255), thickness=2
-                )
-                for px, py in ordered:
-                    cv2.circle(frame, (int(px), int(py)), 4, (0, 255, 255), -1)
+    # deactivate & prune
+    alive = []
+    for t in tracks:
+        if frame_idx - t.last_frame <= persist:
+            # nếu không cập nhật và quá hạn exit thì giảm active
+            if not t.just_updated and t.conf < exit_c:
+                t.active = False
+            alive.append(t)
+    return alive
+
+
+def draw_tracks(frame, tracks, args):
+    for t in tracks:
+        if not t.active:
+            continue
+        x1, y1, x2, y2 = map(int, t.box)
+        if not args.no_bbox:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+            cv2.putText(
+                frame,
+                f"plate {t.conf:.2f}",
+                (x1, max(0, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 200, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        if t.kps is not None and t.kps.shape[0] >= 4:
+            pts4 = t.kps.astype(int)
+            if args.ultra_style:
+                for px, py in pts4:
+                    cv2.circle(
+                        frame, (int(px), int(py)), 4, (255, 255, 0), -1, cv2.LINE_AA
+                    )
+                edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+                for a, b in edges:
+                    cv2.line(
+                        frame,
+                        tuple(pts4[a]),
+                        tuple(pts4[b]),
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
             else:
-                # Fallback: draw whatever points are available
-                for px, py in pts[:4]:
-                    cv2.circle(frame, (int(px), int(py)), 4, (0, 255, 255), -1)
-
+                colors = [(255, 255, 0), (255, 255, 0), (255, 255, 0), (255, 255, 0)]
+                for i, (px, py) in enumerate(pts4):
+                    cv2.circle(
+                        frame, (int(px), int(py)), 4, colors[i % 4], -1, cv2.LINE_AA
+                    )
+                    # draw polygon in yellow
+                    cv2.polylines(
+                        frame, [pts4.reshape(-1, 1, 2)], True, (0, 255, 255), 2, cv2.LINE_AA
+                    )
     return frame
 
 
 def main():
     args = parse_args()
-
     if args.list_cams:
-        available = []
-        for i in range(10):
-            cap_test = cv2.VideoCapture(i, cv2.CAP_V4L2)
-            if cap_test.isOpened():
-                available.append(i)
-                cap_test.release()
-        print("Camera khả dụng:", available if available else "(không tìm thấy)")
+        print("Cameras:", list_cams())
         return
-
-    # Đảm bảo hiển thị Qt trên X11 nếu Wayland thiếu plugin
     if os.environ.get("QT_QPA_PLATFORM") is None:
         os.environ["QT_QPA_PLATFORM"] = "xcb"
-
-    # Chọn weights: ưu tiên args.model -> runs/.../best.pt -> last.pt
-    candidates = []
-    if args.model:
-        candidates.append(args.model)
-    candidates += [
-        "runs/pose_plate/weights/best.pt",
-        "runs/pose_plate/weights/last.pt",
-    ]
-    seen = set()
-    candidates = [m for m in candidates if not (m in seen or seen.add(m))]
-
-    chosen = None
-    for m in candidates:
-        if os.path.exists(m):
-            chosen = m
-            break
-    if not chosen:
-        print(
-            "❌ Không tìm thấy weights. Dùng --model để chỉ định hoặc đặt tại runs/pose_plate/weights/best.pt"
-        )
-        return
-
     device = (
-        args.device
-        if args.device is not None
-        else ("cuda" if torch.cuda.is_available() else "cpu")
+        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    print(f"⚡ Device: {device}")
-    print(f"✅ Using model: {chosen}")
-    model = YOLO(chosen).to(device)
-
-    # Optional fallback detector
-    fallback_model = None
-    if args.fallback_model and os.path.exists(args.fallback_model):
-        try:
-            fallback_model = YOLO(args.fallback_model).to(device)
-            print(f"ℹ️  Fallback detector ready: {args.fallback_model}")
-        except Exception as e:
-            print("⚠️  Không thể tải fallback model:", e)
-
-    cap = open_capture(args.source)
+    weight_path = "best_50.pt"  # cố định theo yêu cầu
+    model = load_model(weight_path, device)
+    cap = open_stream(args.source)
     if cap is None or not cap.isOpened():
-        print("❌ Không mở được nguồn video.")
-        print("Gợi ý: --list-cams (webcam) hoặc dùng đường dẫn file/RTSP hợp lệ")
+        print("❌ Không mở được nguồn video")
         return
-
     cv2.namedWindow("Plate", cv2.WINDOW_NORMAL)
-
+    tracks = []
+    frame_idx = 0
     while True:
         ok, frame = cap.read()
         if not ok or frame is None:
             continue
         if args.resize:
             frame = cv2.resize(frame, tuple(args.resize))
-
+        infer_conf = 0.0 if args.no_filter else args.conf
         res = model(
             frame,
             imgsz=args.imgsz,
-            conf=args.conf,
+            conf=infer_conf,
             iou=args.iou,
-            classes=[0],  # only license plate class
+            classes=[0],
             verbose=False,
             max_det=args.max_det,
         )[0]
-        n_boxes = int(len(res.boxes)) if res.boxes is not None else 0
-
-        # Fallback to detector if pose returns 0 boxes
-        used_fallback = False
-        if n_boxes == 0 and fallback_model is not None:
-            res = fallback_model(
-                frame,
-                conf=args.conf,
-                iou=args.iou,
-                classes=[0],
-                verbose=False,
-                max_det=args.max_det,
-            )[0]
-            used_fallback = True
-            n_boxes = int(len(res.boxes)) if res.boxes is not None else 0
-
-        if args.debug:
-            msg = f"det:{n_boxes} conf>={args.conf}"
-            if used_fallback:
-                msg += " [fallback]"
-            cv2.putText(
-                frame,
-                msg,
-                (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-        frame = draw_plates_and_pose(
-            frame,
-            res,
-            conf_thresh=args.conf,
-            min_area=args.min_area,
-            max_area=args.max_area,
-            min_aspect=args.min_aspect,
-            max_aspect=args.max_aspect,
-            debug=args.debug,
-        )
-
+        # cập nhật track
+        tracks = update_tracks(tracks, res, args, frame_idx)
+        frame = draw_tracks(frame, tracks, args)
+        frame_idx += 1
         cv2.imshow("Plate", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
-
     cap.release()
     cv2.destroyAllWindows()
 

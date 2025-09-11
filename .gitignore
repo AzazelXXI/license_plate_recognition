@@ -1,5 +1,9 @@
 .venv
-dataset
-dataset1
+archive_1
+archive_2
 dataset4corner
+merged_dataset
+prep_merged_dataset
+prep_merged_dataset_blend
+prep_merged_dataset_blend.zip
 MakeFile

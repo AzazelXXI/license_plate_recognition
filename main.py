@@ -379,7 +379,7 @@ def main():
     device = (
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    weight_path = "best_200.pt"  # cố định theo yêu cầu
+    weight_path = "best.pt"  # cố định theo yêu cầu
     model = load_model(weight_path, device)
     cap = open_stream(args.source)
     if cap is None or not cap.isOpened():

@@ -364,9 +364,143 @@ def draw_tracks(frame, tracks, args):
                     )
                     # draw polygon in yellow
                     cv2.polylines(
-                        frame, [pts4.reshape(-1, 1, 2)], True, (0, 255, 255), 2, cv2.LINE_AA
+                        frame,
+                        [pts4.reshape(-1, 1, 2)],
+                        True,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
                     )
     return frame
+
+    def order_points(pts):
+        # pts: ndarray shape (4,2)
+        # Trả về: pts đã sắp xếp theo [top-left, top-right, bottom-right, bottom-left]
+        # Cải tiến: dùng cả tổng, hiệu và khoảng cách đến trọng tâm để tăng ổn định
+        pts = pts.astype("float32")
+        center = np.mean(pts, axis=0)
+        # Tính góc của từng điểm so với trọng tâm
+        angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+        # Quy ước:
+        # -pi -> pi: TL(-pi), TR(-pi/2), BR(0), BL(pi/2)
+        # Sắp xếp theo góc: TL, TR, BR, BL (ngược chiều kim đồng hồ)
+        idxs = np.argsort(angles)
+        sorted_pts = pts[idxs]
+
+        # Đảm bảo thứ tự bắt đầu từ top-left (góc nhỏ nhất)
+        # Nếu không đúng, xoay cho đúng thứ tự
+        def is_top_left(pt, center):
+            return pt[0] < center[0] and pt[1] < center[1]
+
+        for i in range(4):
+            if is_top_left(sorted_pts[i], center):
+                sorted_pts = np.roll(sorted_pts, -i, axis=0)
+                break
+        return sorted_pts.astype(int)
+
+    def draw_tracks(frame, tracks, args):
+        warped_show = None
+        for t in tracks:
+            if not t.active:
+                continue
+            x1, y1, x2, y2 = map(int, t.box)
+            if not args.no_bbox:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+                cv2.putText(
+                    frame,
+                    f"plate {t.conf:.2f}",
+                    (x1, max(0, y1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 200, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+            if t.kps is not None and t.kps.shape[0] >= 4:
+                pts4 = t.kps[:4].astype(int)
+                pts4 = order_points(pts4)
+                # --- WARP & CROP ---
+                # Đặt kích thước chuẩn cho biển số (có thể chỉnh lại tuỳ nhu cầu)
+                plate_w, plate_h = 220, 70
+                dst = np.array(
+                    [
+                        [0, 0],
+                        [plate_w - 1, 0],
+                        [plate_w - 1, plate_h - 1],
+                        [0, plate_h - 1],
+                    ],
+                    dtype="float32",
+                )
+                M = cv2.getPerspectiveTransform(pts4.astype(np.float32), dst)
+                warped = cv2.warpPerspective(frame, M, (plate_w, plate_h))
+                warped_show = warped
+                # --- VẼ KEYPOINTS ---
+                if args.ultra_style:
+                    for px, py in pts4:
+                        cv2.circle(
+                            frame, (int(px), int(py)), 4, (255, 255, 0), -1, cv2.LINE_AA
+                        )
+                    edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+                    for a, b in edges:
+                        cv2.line(
+                            frame,
+                            tuple(pts4[a]),
+                            tuple(pts4[b]),
+                            (0, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                else:
+                    colors = [
+                        (255, 255, 0),
+                        (255, 255, 0),
+                        (255, 255, 0),
+                        (255, 255, 0),
+                    ]
+                    for i, (px, py) in enumerate(pts4):
+                        cv2.circle(
+                            frame, (int(px), int(py)), 4, colors[i % 4], -1, cv2.LINE_AA
+                        )
+                        # Vẽ số thứ tự điểm để debug
+                        cv2.putText(
+                            frame,
+                            str(i),
+                            (int(px) + 5, int(py) - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 0, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                    # draw polygon in yellow
+                    cv2.polylines(
+                        frame,
+                        [pts4.reshape(-1, 1, 2)],
+                        True,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+        # Hiển thị vùng biển số đã warp ở góc trên bên phải
+        if warped_show is not None:
+            h, w = warped_show.shape[:2]
+            # scale nhỏ lại nếu cần
+            scale = 1.0
+            if h > 60:
+                scale = 60.0 / h
+            warped_small = cv2.resize(warped_show, (int(w * scale), int(h * scale)))
+            fh, fw = frame.shape[:2]
+            # dán vào góc phải trên
+            x_offset = fw - warped_small.shape[1] - 10
+            y_offset = 10
+            frame[
+                y_offset : y_offset + warped_small.shape[0],
+                x_offset : x_offset + warped_small.shape[1],
+            ] = warped_small
+        return frame
+
+
+import numpy as np
 
 
 def main():
@@ -379,7 +513,7 @@ def main():
     device = (
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    weight_path = "best.pt"  # cố định theo yêu cầu
+    weight_path = "best_200.pt"  # cố định theo yêu cầu
     model = load_model(weight_path, device)
     cap = open_stream(args.source)
     if cap is None or not cap.isOpened():
